@@ -5,8 +5,6 @@
 # Aether
 ### Wireless Android Mirror for Linux
 
-Mirror your Android phone over Wi-Fi — no USB, no terminal, no hassle.
-
 ![Early Version](https://img.shields.io/badge/status-early%20version-orange)
 ![Platform](https://img.shields.io/badge/platform-Linux-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
@@ -20,7 +18,7 @@ Mirror your Android phone over Wi-Fi — no USB, no terminal, no hassle.
 
 ## What is Aether?
 
-Aether is a clean GTK4 desktop app that lets you wirelessly mirror your Android phone to your Linux PC using ADB and scrcpy — all through a simple GUI. No typing commands, no fiddling with IPs. Just pair once and click Mirror.
+Aether is a GTK4 desktop app that lets you wirelessly mirror your Android phone to your Linux PC using ADB and scrcpy.
 
 ---
 
@@ -33,7 +31,6 @@ Aether is a clean GTK4 desktop app that lets you wirelessly mirror your Android 
 - **Per-device settings** — resolution, FPS, bitrate, codec, screen behaviour — all configurable per device
 - **H.265 support** — uses H.265 if your system supports it, falls back to H.264 automatically
 - **Auto disconnect** — ADB disconnects cleanly 30 seconds after you close the mirror window
-- **Minimal UI** — phone-shaped window, dark theme, no clutter
 
 ---
 
@@ -81,7 +78,7 @@ chmod +x install.sh
 ./install.sh
 ```
 
-Then open **Aether** from your app drawer.
+The install script will automatically install dependencies for your distro, then install Aether. Open it from your app drawer when done.
 
 ---
 
