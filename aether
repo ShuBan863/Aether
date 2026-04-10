@@ -405,9 +405,14 @@ class AetherWindow(Adw.ApplicationWindow):
         cmd  = ["scrcpy"]
         if serial: cmd += ["-s", serial]
         cmd += args
+        # No titlebar — drag by holding top edge; aspect ratio locked via size hints
+        cmd += ["--window-borderless"]
+        cmd += ["--window-title", "AetherMirror"]
         try:
             self.mirror_proc = subprocess.Popen(
-                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT)
         except FileNotFoundError:
             self.mirror_dev = None
             self._mirror_fail(dev, ip_port)
@@ -423,6 +428,70 @@ class AetherWindow(Adw.ApplicationWindow):
 
         threading.Thread(target=self._watch_scrcpy,
                          args=(dev, ip_port), daemon=True).start()
+        threading.Thread(target=self._fixup_scrcpy_window,
+                         daemon=True).start()
+
+    def _fixup_scrcpy_window(self):
+        """
+        Read scrcpy stdout to get the texture size, then use wmctrl/xprop
+        to: hide from taskbar, lock aspect ratio, enable drag on borderless window.
+        Falls back gracefully if tools aren't available.
+        """
+        import time, re as _re
+        # Step 1: read texture size from scrcpy output
+        tex_w = tex_h = 0
+        if self.mirror_proc and self.mirror_proc.stdout:
+            try:
+                for raw in self.mirror_proc.stdout:
+                    line = raw.decode("utf-8", errors="replace")
+                    m = _re.search(r"Texture:\s*(\d+)x(\d+)", line)
+                    if m:
+                        tex_w, tex_h = int(m.group(1)), int(m.group(2))
+                        break
+            except Exception:
+                pass
+            # Drain remaining output so process never blocks
+            threading.Thread(
+                target=lambda: self.mirror_proc and
+                               self.mirror_proc.stdout and
+                               self.mirror_proc.stdout.read(),
+                daemon=True).start()
+
+        # Step 2: find the window by title (works on X11/XWayland)
+        wid = None
+        for _ in range(50):
+            time.sleep(0.1)
+            out, _, rc = run("xdotool", "search", "--name", "AetherMirror")
+            if rc == 0 and out.strip():
+                wid = out.strip().splitlines()[-1]
+                break
+        if not wid:
+            return
+
+        # Step 3: hide from taskbar and pager
+        run("xprop", "-id", wid,
+            "-f", "_NET_WM_STATE", "32a",
+            "-set", "_NET_WM_STATE",
+            "_NET_WM_STATE_SKIP_TASKBAR,_NET_WM_STATE_SKIP_PAGER")
+
+        # Step 4: lock aspect ratio via WM_NORMAL_HINTS
+        # Use texture size if we got it, otherwise read window geometry
+        if tex_w <= 0 or tex_h <= 0:
+            out, _, rc = run("xdotool", "getwindowgeometry", "--shell", wid)
+            if rc == 0:
+                gdict = {}
+                for line in out.splitlines():
+                    if "=" in line:
+                        k, v = line.split("=", 1)
+                        gdict[k.strip()] = v.strip()
+                tex_w = int(gdict.get("WIDTH", 0))
+                tex_h = int(gdict.get("HEIGHT", 0))
+        if tex_w > 0 and tex_h > 0:
+            # PAspect flag = 0x30 (bits 4+5), set min and max aspect to same value
+            run("xprop", "-id", wid,
+                "-f", "WM_NORMAL_HINTS", "32i",
+                "-set", "WM_NORMAL_HINTS",
+                f"48, 0, 0, 0, 0, {tex_w}, {tex_h}, 0, 0, {tex_w}, {tex_h}, 1, 1")
 
     def _watch_scrcpy(self, dev, ip_port):
         if self.mirror_proc:
@@ -872,7 +941,12 @@ class AetherApp(Adw.Application):
     def __init__(self):
         super().__init__(application_id="io.github.aether",
                          flags=Gio.ApplicationFlags.FLAGS_NONE)
-        self.connect("activate", lambda _: AetherWindow(self).present())
+        self.connect("activate", self._on_activate)
+
+    def _on_activate(self, _):
+        win = AetherWindow(self)
+        win.set_icon_name("aether")
+        win.present()
 
 if __name__ == "__main__":
     import sys
