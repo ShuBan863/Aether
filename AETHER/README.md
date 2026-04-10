@@ -37,12 +37,6 @@ Aether is a clean GTK4 desktop app that lets you wirelessly mirror your Android 
 
 ---
 
-## Screenshots
-
-> Coming soon.
-
----
-
 ## Requirements
 
 | Package | Purpose |
@@ -134,8 +128,6 @@ Settings are stored in plain JSON at:
 ```
 ~/.config/aether/devices.json
 ```
-
-You can edit this manually if needed.
 
 ---
 
