@@ -13,13 +13,13 @@ echo ""
 echo "  Installing dependencies..."
 
 if command -v dnf &>/dev/null; then
-    sudo dnf install -y python3-gobject gtk4 libadwaita android-tools scrcpy NetworkManager avahi-tools ffmpeg
+    sudo dnf install -y python3-gobject gtk4 libadwaita android-tools scrcpy NetworkManager avahi-tools ffmpeg xdotool wmctrl python3-xlib
 
 elif command -v apt &>/dev/null; then
-    sudo apt install -y python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 adb scrcpy network-manager avahi-utils ffmpeg
+    sudo apt install -y python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 adb scrcpy network-manager avahi-utils ffmpeg xdotool wmctrl python3-xlib
 
 elif command -v pacman &>/dev/null; then
-    sudo pacman -S --noconfirm python-gobject gtk4 libadwaita android-tools scrcpy networkmanager avahi ffmpeg
+    sudo pacman -S --noconfirm python-gobject gtk4 libadwaita android-tools scrcpy networkmanager avahi ffmpeg xdotool wmctrl python-xlib
 
 else
     echo "  Warning: Could not detect package manager. Install dependencies manually."
@@ -41,7 +41,7 @@ else
     echo "  Warning: ae.png not found, skipping icon."
 fi
 
-cat > "$INSTALL_APPS/aether.desktop" << DESKTOP
+cat > "$INSTALL_APPS/io.github.aether.desktop" << DESKTOP
 [Desktop Entry]
 Name=Aether
 Comment=Wireless Android Mirror — manage ADB devices and launch scrcpy
@@ -52,7 +52,11 @@ Type=Application
 Categories=Utility;Network;
 Keywords=android;adb;mirror;scrcpy;wireless;
 StartupWMClass=aether
+StartupNotify=true
 DESKTOP
+
+# Remove old desktop entry if present
+rm -f "$INSTALL_APPS/aether.desktop"
 
 gtk-update-icon-cache -f "$HOME/.local/share/icons/hicolor/" 2>/dev/null || true
 update-desktop-database "$INSTALL_APPS" 2>/dev/null || true

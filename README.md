@@ -31,6 +31,8 @@ Aether is a GTK4 desktop app that lets you wirelessly mirror your Android phone 
 - **Per-device settings** — resolution, FPS, bitrate, codec, screen behaviour — all configurable per device
 - **H.265 support** — uses H.265 if your system supports it, falls back to H.264 automatically
 - **Auto disconnect** — ADB disconnects cleanly 30 seconds after you close the mirror window
+- **Borderless mirror window** — no title bar, aspect-ratio locked resize (no black bars ever)
+- **Custom icons** — Aether and the mirror window each have their own icon in the dock and app switcher
 
 ---
 
@@ -45,6 +47,9 @@ Aether is a GTK4 desktop app that lets you wirelessly mirror your Android phone 
 | `adb` (android-tools) | Android Debug Bridge |
 | `scrcpy` | Screen mirroring engine |
 | `nmcli` (NetworkManager) | Wi-Fi SSID detection |
+| `xdotool` | Mirror window geometry & drag detection |
+| `wmctrl` | Mirror window management |
+| `python3-xlib` | Native window move support |
 | `avahi-tools` *(optional)* | mDNS device discovery |
 | `ffmpeg` *(optional)* | H.265 codec detection |
 
@@ -56,17 +61,17 @@ Aether is a GTK4 desktop app that lets you wirelessly mirror your Android phone 
 
 **Fedora:**
 ```bash
-sudo dnf install python3-gobject gtk4 libadwaita android-tools scrcpy NetworkManager avahi-tools ffmpeg
+sudo dnf install python3-gobject gtk4 libadwaita android-tools scrcpy NetworkManager avahi-tools ffmpeg xdotool wmctrl python3-xlib
 ```
 
 **Ubuntu / Debian:**
 ```bash
-sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 adb scrcpy network-manager avahi-utils ffmpeg
+sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 adb scrcpy network-manager avahi-utils ffmpeg xdotool wmctrl python3-xlib
 ```
 
 **Arch Linux:**
 ```bash
-sudo pacman -S python-gobject gtk4 libadwaita android-tools scrcpy networkmanager avahi ffmpeg
+sudo pacman -S python-gobject gtk4 libadwaita android-tools scrcpy networkmanager avahi ffmpeg xdotool wmctrl python-xlib
 ```
 
 ### 2. Clone and install Aether
@@ -99,6 +104,8 @@ The install script will automatically install dependencies for your distro, then
 |---|---|
 | Mirror a device | Click device → click **Mirror** |
 | Stop mirroring | Click **Stop** |
+| **Move the mirror window** | Click and drag the centre strip at the top of the phone screen (the status bar area) |
+| **Resize the mirror window** | Drag any edge or corner — aspect ratio is locked so no black bars appear |
 | Edit device settings | Click the ⚙ icon on any device row |
 | Add a new device | Click **Add Device** (the + row) |
 | Switch networks | Aether auto-uses the saved IP for your current Wi-Fi |

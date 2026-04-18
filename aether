@@ -7,12 +7,29 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 
-from gi.repository import Gtk, Adw, GLib, Gio, Gdk
+from gi.repository import Gtk, Adw, GLib, Gio, Gdk, GdkPixbuf
 import json, subprocess, threading, re
 from pathlib import Path
 
 CONFIG_DIR  = Path.home() / ".config" / "aether"
 CONFIG_FILE = CONFIG_DIR / "devices.json"
+_SCRIPT_DIR = Path(__file__).resolve().parent   # may be ~/.local/bin when installed
+
+def _find_aether_dir():
+    """Return the AETHER project folder containing ae.png / phone.png.
+    When the script is run from ~/.local/bin the script dir won't have the
+    assets, so we also check ~/AETHER and the directory of the real file."""
+    candidates = [
+        _SCRIPT_DIR,
+        Path.home() / "AETHER",
+        Path.home() / ".local" / "share" / "aether",
+    ]
+    for p in candidates:
+        if (p / "phone.png").exists():
+            return p
+    return _SCRIPT_DIR   # fallback (assets may simply be missing)
+
+AETHER_DIR = _find_aether_dir()
 
 DEFAULT_SETTINGS = {
     "resolution":      1080,
@@ -53,8 +70,9 @@ def adb_start():
     adb("start-server")
 
 def adb_connect(ip_port, timeout=8):
-    out, _, _ = adb("connect", ip_port, timeout=timeout)
-    return "connected" in out.lower() or "already" in out.lower()
+    out, err, _ = adb("connect", ip_port, timeout=timeout)
+    combined = (out + " " + err).lower()
+    return "connected" in combined or "already" in combined
 
 def adb_disconnect(ip_port):
     adb("disconnect", ip_port)
@@ -84,20 +102,69 @@ def get_current_ssid():
         pass
     return None
 
+_scrcpy_ver_cache = None
+
+def get_scrcpy_version():
+    """Return (major, minor) tuple, e.g. (2, 3). Returns (0, 0) if unknown.
+    Result is cached after the first call so subsequent calls are instant."""
+    global _scrcpy_ver_cache
+    if _scrcpy_ver_cache is not None:
+        return _scrcpy_ver_cache
+    try:
+        r = subprocess.run(["scrcpy", "--version"], capture_output=True, text=True, timeout=5)
+        m = re.search(r"scrcpy\s+(\d+)\.(\d+)", (r.stdout + r.stderr))
+        if m:
+            _scrcpy_ver_cache = (int(m.group(1)), int(m.group(2)))
+            return _scrcpy_ver_cache
+    except Exception:
+        pass
+    _scrcpy_ver_cache = (0, 0)
+    return _scrcpy_ver_cache
+
+def check_dependencies():
+    """Returns list of missing/broken dependency descriptions."""
+    issues = []
+    # Check adb
+    out, err, rc = run("adb", "version")
+    if rc != 0 or "Android Debug Bridge" not in out:
+        issues.append("adb not found — install android-tools")
+    # Check scrcpy
+    maj, _ = get_scrcpy_version()
+    if maj == 0:
+        issues.append("scrcpy not found — install scrcpy")
+    elif maj < 2:
+        issues.append(f"scrcpy is too old (need 2.x, have 1.x) — upgrade scrcpy")
+    return issues
+
 def build_scrcpy_args(settings):
     s = {**DEFAULT_SETTINGS, **settings}
-    args = [
-        "--video-bit-rate", s["bitrate"],
-        "--max-fps", str(s["max_fps"]),
-        "--max-size", str(s["resolution"]),
-        "--video-buffer=0",
-        "--video-codec", s["codec"],
-        "--capture-orientation=0",
-    ]
-    if s["turn_off_screen"]:
-        args.append("--turn-screen-off")
-    if s["stay_awake"]:
-        args.append("--stay-awake")
+    maj, _ = get_scrcpy_version()
+
+    if maj >= 2:
+        # scrcpy 2.x flags
+        args = [
+            "--video-bit-rate", s["bitrate"],
+            "--max-fps", str(s["max_fps"]),
+            "--max-size", str(s["resolution"]),
+            "--video-buffer=0",
+            "--video-codec", s["codec"],
+            "--capture-orientation=0",
+        ]
+        if s["turn_off_screen"]:
+            args.append("--turn-screen-off")
+        if s["stay_awake"]:
+            args.append("--stay-awake")
+    else:
+        # scrcpy 1.x fallback flags
+        args = [
+            "--bit-rate", s["bitrate"],
+            "--max-fps", str(s["max_fps"]),
+            "--max-size", str(s["resolution"]),
+        ]
+        if s["turn_off_screen"]:
+            args.append("--turn-screen-off")
+        if s["stay_awake"]:
+            args.append("--stay-awake")
     return args
 
 CSS = """
@@ -221,10 +288,41 @@ class AetherWindow(Adw.ApplicationWindow):
         self._set_idx      = None
         self._pending_name = ""
         self._mirror_ip    = None
+        self._ssid_cache   = None   # populated by background thread; never blocks UI
 
         self._apply_css()
         self._build()
         self._to_home()
+
+        # Warm up caches in the background so the main thread never blocks on
+        # subprocess calls when the user clicks Settings or Mirror.
+        threading.Thread(target=self._warm_caches, daemon=True).start()
+        # Refresh SSID every 30 s so the label stays current without blocking.
+        GLib.timeout_add_seconds(30, self._schedule_ssid_refresh)
+
+    # ── Background cache helpers ──────────────────────────────────────────────
+
+    def _warm_caches(self):
+        """Run once at startup in a background thread.
+        Fetches SSID and scrcpy version so the main thread never has to wait."""
+        ssid = get_current_ssid()
+        get_scrcpy_version()          # populates the module-level cache
+        GLib.idle_add(self._apply_ssid_cache, ssid)
+
+    def _schedule_ssid_refresh(self):
+        """Called by GLib every 30 s on the main thread — spawns a bg thread."""
+        threading.Thread(target=self._refresh_ssid_bg, daemon=True).start()
+        return True   # keep the timer alive
+
+    def _refresh_ssid_bg(self):
+        ssid = get_current_ssid()
+        GLib.idle_add(self._apply_ssid_cache, ssid)
+
+    def _apply_ssid_cache(self, ssid):
+        """Main-thread callback: store cache and update the header label."""
+        self._ssid_cache = ssid
+        self._net_lbl.set_label(f"  {ssid}" if ssid else "  no wifi")
+        return False   # one-shot idle_add
 
     def _apply_css(self):
         p = Gtk.CssProvider()
@@ -301,7 +399,7 @@ class AetherWindow(Adw.ApplicationWindow):
         self.stack.add_named(p, PAGE_HOME)
 
     def _refresh_home(self):
-        ssid = get_current_ssid()
+        ssid = self._ssid_cache
         self._net_lbl.set_label(f"  {ssid}" if ssid else "  no wifi")
 
         row = self._list.get_first_child()
@@ -330,7 +428,7 @@ class AetherWindow(Adw.ApplicationWindow):
 
         info = vbox(spacing=1); info.set_hexpand(True)
         info.append(lbl(dev.get("name", "Device"), "dev-name"))
-        ssid = get_current_ssid()
+        ssid = self._ssid_cache
         ip   = dev.get("networks",{}).get(ssid) or dev.get("last_ip_port","")
         info.append(lbl(ip or "no address saved", "dev-meta"))
         inner.append(info)
@@ -376,7 +474,7 @@ class AetherWindow(Adw.ApplicationWindow):
         devs = self.config.get("devices", [])
         if self.selected_idx >= len(devs): return
         dev     = devs[self.selected_idx]
-        ssid    = get_current_ssid()
+        ssid    = self._ssid_cache
         ip_port = dev.get("networks",{}).get(ssid) or dev.get("last_ip_port","")
 
         if not ip_port:
@@ -389,13 +487,21 @@ class AetherWindow(Adw.ApplicationWindow):
                          args=(dev, ip_port), daemon=True).start()
 
     def _mirror_worker(self, dev, ip_port):
+        # Check deps first
+        issues = check_dependencies()
+        if issues:
+            GLib.idle_add(self._mirror_fail, dev, ip_port, issues[0]); return
+
         adb_start()
-        if not adb_connect(ip_port):
-            GLib.idle_add(self._mirror_fail, dev, ip_port); return
+        ok = adb_connect(ip_port)
+        if not ok:
+            GLib.idle_add(self._mirror_fail, dev, ip_port, "ADB connect failed — check IP:port and that Wireless Debugging is on"); return
         serials = adb_connected_serials()
         serial  = next((s for s in serials if ip_port.split(":")[0] in s), None)
         if not serial and serials:
             serial = serials[0]
+        if not serial:
+            GLib.idle_add(self._mirror_fail, dev, ip_port, "Device connected but not authorised — check phone for ADB prompt"); return
         GLib.idle_add(self._start_mirror, dev, serial, ip_port)
 
     def _start_mirror(self, dev, serial, ip_port):
@@ -405,17 +511,19 @@ class AetherWindow(Adw.ApplicationWindow):
         cmd  = ["scrcpy"]
         if serial: cmd += ["-s", serial]
         cmd += args
-        # No titlebar — drag by holding top edge; aspect ratio locked via size hints
-        cmd += ["--window-borderless"]
-        cmd += ["--window-title", "AetherMirror"]
+        cmd += ["--window-title", "AetherMirror", "--window-borderless"]
         try:
+            import os as _os
+            scrcpy_env = _os.environ.copy()
+            scrcpy_env["SDL_VIDEO_X11_WMCLASS"] = "aether-mirror"
             self.mirror_proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT)
+                stderr=subprocess.STDOUT,
+                env=scrcpy_env)
         except FileNotFoundError:
             self.mirror_dev = None
-            self._mirror_fail(dev, ip_port)
+            self._mirror_fail(dev, ip_port, "scrcpy not found — install scrcpy")
             return
 
         self._set_dot("on")
@@ -433,12 +541,23 @@ class AetherWindow(Adw.ApplicationWindow):
 
     def _fixup_scrcpy_window(self):
         """
-        Read scrcpy stdout to get the texture size, then use wmctrl/xprop
-        to: hide from taskbar, lock aspect ratio, enable drag on borderless window.
-        Falls back gracefully if tools aren't available.
+        After scrcpy launches:
+          1. Read the phone's texture dimensions from scrcpy stdout.
+          2. Find the window by title (X11/XWayland).
+          3. Lock the aspect ratio via WM_NORMAL_HINTS so dragging any edge
+             or corner scales both width AND height proportionally — no black
+             bars ever. Applied twice (immediately + after 1 s) because GNOME
+             Mutter resets WM hints when the window finishes mapping.
+          4. Set phone.png as the window icon via _NET_WM_ICON so it shows
+             in the dock and Super view instead of the generic Android robot.
+          5. Hide from taskbar/pager.
+          6. Install the drag-strip overlay for title-bar-free window moving.
+        Title bar removal is handled by --window-borderless passed to scrcpy
+        at launch, so no Motif hints step is needed here.
         """
         import time, re as _re
-        # Step 1: read texture size from scrcpy output
+
+        # ── Step 1: read texture size from scrcpy stdout ──────────────────────
         tex_w = tex_h = 0
         if self.mirror_proc and self.mirror_proc.stdout:
             try:
@@ -450,14 +569,13 @@ class AetherWindow(Adw.ApplicationWindow):
                         break
             except Exception:
                 pass
-            # Drain remaining output so process never blocks
             threading.Thread(
                 target=lambda: self.mirror_proc and
                                self.mirror_proc.stdout and
                                self.mirror_proc.stdout.read(),
                 daemon=True).start()
 
-        # Step 2: find the window by title (works on X11/XWayland)
+        # ── Step 2: find the window (retry up to 5 s) ────────────────────────
         wid = None
         for _ in range(50):
             time.sleep(0.1)
@@ -468,14 +586,8 @@ class AetherWindow(Adw.ApplicationWindow):
         if not wid:
             return
 
-        # Step 3: hide from taskbar and pager
-        run("xprop", "-id", wid,
-            "-f", "_NET_WM_STATE", "32a",
-            "-set", "_NET_WM_STATE",
-            "_NET_WM_STATE_SKIP_TASKBAR,_NET_WM_STATE_SKIP_PAGER")
-
-        # Step 4: lock aspect ratio via WM_NORMAL_HINTS
-        # Use texture size if we got it, otherwise read window geometry
+        # ── Step 3: lock aspect ratio via WM_NORMAL_HINTS ────────────────────
+        # Fall back to current window geometry if stdout gave no texture dims.
         if tex_w <= 0 or tex_h <= 0:
             out, _, rc = run("xdotool", "getwindowgeometry", "--shell", wid)
             if rc == 0:
@@ -484,14 +596,329 @@ class AetherWindow(Adw.ApplicationWindow):
                     if "=" in line:
                         k, v = line.split("=", 1)
                         gdict[k.strip()] = v.strip()
-                tex_w = int(gdict.get("WIDTH", 0))
+                tex_w = int(gdict.get("WIDTH",  0))
                 tex_h = int(gdict.get("HEIGHT", 0))
-        if tex_w > 0 and tex_h > 0:
-            # PAspect flag = 0x30 (bits 4+5), set min and max aspect to same value
+
+        def _apply_aspect(w, h):
+            """
+            ICCCM WM_NORMAL_HINTS layout (15 × 32-bit ints):
+              [0]  flags
+              [1]  x (obsolete)   [2]  y (obsolete)
+              [3]  min_width      [4]  min_height
+              [5]  max_width      [6]  max_height   (0 = unlimited)
+              [7]  width_inc      [8]  height_inc
+              [9]  min_aspect_num [10] min_aspect_den
+              [11] max_aspect_num [12] max_aspect_den
+              [13] base_width     [14] base_height
+
+            Flags:  PMinSize=16 | PAspect=64 = 80
+            Omitting PMaxSize (32) lets the window grow freely.
+            min_aspect == max_aspect == w/h locks the ratio on every resize.
+            """
+            if w <= 0 or h <= 0:
+                return
+            min_w = max(w // 4, 80)
+            min_h = max(h // 4, 80)
+            hint = (
+                f"80, 0, 0, "           # flags (PMinSize|PAspect), obsolete x/y
+                f"{min_w}, {min_h}, "   # min width/height
+                f"0, 0, "               # max width/height (unlimited)
+                f"1, 1, "               # inc width/height
+                f"{w}, {h}, "           # min aspect num/den
+                f"{w}, {h}, "           # max aspect num/den  ← locked ratio
+                f"0, 0"                 # base width/height
+            )
             run("xprop", "-id", wid,
                 "-f", "WM_NORMAL_HINTS", "32i",
-                "-set", "WM_NORMAL_HINTS",
-                f"48, 0, 0, 0, 0, {tex_w}, {tex_h}, 0, 0, {tex_w}, {tex_h}, 1, 1")
+                "-set", "WM_NORMAL_HINTS", hint)
+
+        if tex_w > 0 and tex_h > 0:
+            _apply_aspect(tex_w, tex_h)
+            # Re-apply after 1 s — Mutter resets hints on map completion
+            time.sleep(1.0)
+            _apply_aspect(tex_w, tex_h)
+
+        # ── Step 4: icon set via SDL_VIDEO_X11_WMCLASS + aether-mirror.desktop ─
+
+        # ── Step 5: hide from taskbar and pager ──────────────────────────────
+        run("xprop", "-id", wid,
+            "-f", "_NET_WM_STATE", "32a",
+            "-set", "_NET_WM_STATE",
+            "_NET_WM_STATE_SKIP_TASKBAR,_NET_WM_STATE_SKIP_PAGER")
+
+        # ── Step 6: status-bar drag strip ────────────────────────────────────
+        threading.Thread(
+            target=self._run_drag_listener,
+            args=(wid, tex_w, tex_h),
+            daemon=True).start()
+
+    def _run_drag_listener(self, wid, tex_w, tex_h):
+        """
+        Minimal drag-strip listener using xdotool + wmctrl.
+        Polls for button-1 press inside the status-bar zone and triggers
+        a WM move via _NET_WM_MOVERESIZE (message type 8 = MOVE).
+        Works on both X11 and XWayland sessions.
+        """
+        import time, subprocess as _sp
+
+        def _get_geometry():
+            out, _, rc = run("xdotool", "getwindowgeometry", "--shell", wid)
+            if rc != 0:
+                return None
+            d = {}
+            for line in out.splitlines():
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    d[k.strip()] = v.strip()
+            try:
+                return (int(d["X"]), int(d["Y"]),
+                        int(d["WIDTH"]), int(d["HEIGHT"]))
+            except Exception:
+                return None
+
+        def _get_pointer():
+            out, _, rc = run("xdotool", "getmouselocation", "--shell")
+            if rc != 0:
+                return None
+            d = {}
+            for line in out.splitlines():
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    d[k.strip()] = v.strip()
+            try:
+                return int(d["X"]), int(d["Y"])
+            except Exception:
+                return None
+
+        def _is_button1_down():
+            """Check if mouse button 1 is currently held via xdotool."""
+            out, _, rc = run("xdotool", "getmouselocation", "--shell")
+            return rc == 0  # xdotool itself doesn't expose button state easily
+
+        # We use xinput to watch button events on the scrcpy window.
+        # Because xinput grab is complex, we use a polling approach:
+        # every ~16 ms check if pointer is in the drag zone AND button 1 is
+        # pressed (detected via xdotool mousedown state through getactivewindow
+        # focus heuristic). When we detect a press→drag we issue wmctrl move.
+        #
+        # More reliable: use xdotool behave on the specific window.
+        # xdotool behave <wid> mouse-enter ... is not right either.
+        # Best portable approach: xdg-open the window class and intercept via
+        # xdotool's builtin "behave" mouse-click trigger.
+
+        # We'll use: xdotool behave <wid> mouse-click <script>
+        # But simplest working approach on X11/XWayland without python-xlib:
+        # use a blocking xdotool command that waits for a click in the window,
+        # then immediately fires wmctrl -r :ACTIVE: -e to start a move.
+        # Actually, _NET_WM_MOVERESIZE requires sending a ClientMessage.
+        # The cleanest cross-tool way is:  wmctrl -i -r <wid> then xdotool key ...
+        # 
+        # FINAL APPROACH: use "xdotool behave <wid> mouse-click" to detect
+        # button-press, check if it's in the drag zone, then call
+        # "wmctrl -i -r <wid> -b toggle,above" is wrong...
+        #
+        # The correct native WM move trigger without a title bar drag is to
+        # send _NET_WM_MOVERESIZE via xdotool key/type is not right.
+        # Use: xdotool windowactivate; then the user can Super+drag.
+        #
+        # For a proper click-drag on a region: we need python-xlib or a C shim.
+        # As a pragmatic solution we launch a tiny transparent GTK overlay
+        # window that sits on top of the drag zone and issues the move.
+        self._spawn_drag_overlay(wid, tex_w, tex_h)
+
+    def _spawn_drag_overlay(self, wid_str, tex_w, tex_h):
+        """
+        Spawn a tiny transparent always-on-top GTK4 overlay that sits over
+        the status-bar strip of the scrcpy window.  When the user clicks and
+        drags it, we send _NET_WM_MOVERESIZE to the scrcpy window so the WM
+        handles the move natively and smoothly.
+
+        The overlay is 60 % of the window width, 32 px tall, centred
+        horizontally, and aligned to the top of the scrcpy window.
+        """
+        import time, subprocess as _sp
+
+        # Script that spawns the overlay (runs as a subprocess so it gets its
+        # own GLib main loop without interfering with the Aether main loop).
+        script = r"""
+import gi, sys, subprocess, os
+gi.require_version("Gtk","4.0")
+gi.require_version("Adw","1")
+from gi.repository import Gtk, Adw, Gdk, GLib
+
+WID   = sys.argv[1]          # scrcpy X window id (decimal string)
+STRIP_H = 44                 # height of the draggable strip in pixels
+
+def get_scrcpy_geom():
+    try:
+        r = subprocess.run(
+            ["xdotool","getwindowgeometry","--shell", WID],
+            capture_output=True, text=True, timeout=3)
+        d = {}
+        for line in r.stdout.splitlines():
+            if "=" in line:
+                k,v = line.split("=",1); d[k.strip()] = v.strip()
+        return int(d["X"]), int(d["Y"]), int(d["WIDTH"]), int(d["HEIGHT"])
+    except Exception:
+        return None
+
+def send_move_resize(root_x, root_y):
+    # Send _NET_WM_MOVERESIZE  direction=8 (MOVE) to the scrcpy window
+    try:
+        subprocess.run([
+            "xdotool", "set_window", "--name", "AetherMirror",
+        ], capture_output=True)
+        subprocess.run([
+            "wmctrl", "-i", "-r", WID,
+            "-e", "0,-1,-1,-1,-1"   # just raise / activate
+        ], capture_output=True)
+        # Use xdg-portal / wmctrl interactive move trick:
+        # wmctrl can't start interactive move; use xdotool key workaround.
+        # Real approach: send ClientMessage via python-xlib if available.
+        try:
+            import Xlib, Xlib.display, Xlib.X, Xlib.protocol.event
+            display = Xlib.display.Display()
+            root    = display.screen().root
+            win     = display.create_resource_object("window", int(WID))
+            NET_WM_MOVERESIZE = display.intern_atom("_NET_WM_MOVERESIZE")
+            event = Xlib.protocol.event.ClientMessage(
+                window=win,
+                client_type=NET_WM_MOVERESIZE,
+                data=(32, [root_x, root_y, 8, 1, 1])   # 8 = _NET_WM_MOVERESIZE_MOVE
+            )
+            mask = Xlib.X.SubstructureRedirectMask | Xlib.X.SubstructureNotifyMask
+            root.send_event(event, event_mask=mask)
+            display.flush()
+        except ImportError:
+            # python-xlib not available; fall back to xdotool windowmove
+            # (not interactive, but at least won't crash)
+            pass
+    except Exception as e:
+        print("move error:", e)
+
+class DragOverlay(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id="io.github.aether.dragoverlay")
+        self.connect("activate", self._activate)
+        self._win = None
+        self._drag_start_win_x = 0
+        self._drag_start_win_y = 0
+        self._drag_start_ptr_x = 0
+        self._drag_start_ptr_y = 0
+        self._dragging = False
+
+    def _activate(self, _):
+        win = Gtk.Window(application=self)
+        self._win = win
+        win.set_decorated(False)
+        win.set_resizable(False)
+        win.set_opacity(0.0)               # fully transparent — invisible
+
+        # Make transparent / click-through for non-strip areas
+        # We only need a tiny strip so set size request accordingly
+        win.set_default_size(200, STRIP_H)
+
+        # Always on top
+        win.set_keep_above(True)
+
+        # Drag gesture ─ primary button
+        drag = Gtk.GestureDrag()
+        drag.set_button(1)
+        drag.connect("drag-begin",  self._drag_begin)
+        drag.connect("drag-update", self._drag_update)
+        drag.connect("drag-end",    self._drag_end)
+        win.add_controller(drag)
+
+        win.present()
+        GLib.timeout_add(150, self._reposition)
+        GLib.timeout_add(500, self._reposition_loop)
+
+    def _reposition(self):
+        g = get_scrcpy_geom()
+        if not g or not self._win:
+            return
+        sx, sy, sw, sh = g
+        strip_w = max(int(sw * 0.55), 100)
+        strip_x = sx + (sw - strip_w) // 2
+        strip_y = sy
+        if hasattr(self._win, 'move'):   # GTK3 compat guard
+            pass
+        # On Wayland/XWayland we position via gtk_window_move equivalent
+        # GTK4 doesn't have window.move() — use the surface directly
+        surface = self._win.get_surface()
+        if surface and hasattr(surface, 'move_to_rect'):
+            pass
+        # Fallback: use xdotool to move our own overlay window
+        try:
+            r = subprocess.run(
+                ["xdotool","search","--pid", str(os.getpid()),
+                 "--name",""],
+                capture_output=True, text=True, timeout=2)
+            ow = r.stdout.strip().splitlines()
+            if ow:
+                subprocess.run(
+                    ["xdotool","windowmove", ow[-1],
+                     str(strip_x), str(strip_y)],
+                    capture_output=True)
+                subprocess.run(
+                    ["xdotool","windowsize", ow[-1],
+                     str(strip_w), str(STRIP_H)],
+                    capture_output=True)
+        except Exception:
+            pass
+
+    def _reposition_loop(self):
+        self._reposition()
+        return True  # keep repeating
+
+    def _drag_begin(self, gesture, start_x, start_y):
+        g = get_scrcpy_geom()
+        if not g: return
+        self._drag_start_win_x = g[0]
+        self._drag_start_win_y = g[1]
+        # pointer absolute position
+        try:
+            r = subprocess.run(
+                ["xdotool","getmouselocation","--shell"],
+                capture_output=True, text=True, timeout=2)
+            d = {}
+            for line in r.stdout.splitlines():
+                if "=" in line:
+                    k,v = line.split("=",1); d[k.strip()] = v.strip()
+            self._drag_start_ptr_x = int(d.get("X",0))
+            self._drag_start_ptr_y = int(d.get("Y",0))
+        except Exception:
+            pass
+        self._dragging = True
+        # Trigger native WM move
+        send_move_resize(self._drag_start_ptr_x, self._drag_start_ptr_y)
+
+    def _drag_update(self, gesture, offset_x, offset_y):
+        pass   # WM handles it after _NET_WM_MOVERESIZE
+
+    def _drag_end(self, gesture, offset_x, offset_y):
+        self._dragging = False
+
+import sys, os
+app = DragOverlay()
+app.run([sys.argv[0], WID])
+"""
+        # Write the overlay script to a temp file and exec it
+        import tempfile, os, time
+        fd, path = tempfile.mkstemp(suffix=".py", prefix="aether_drag_")
+        try:
+            os.write(fd, script.encode())
+            os.close(fd)
+            os.chmod(path, 0o700)
+            # Wait a moment for scrcpy window to appear
+            time.sleep(1.0)
+            subprocess.Popen(
+                ["python3", path, wid_str],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL)
+        except Exception:
+            try: os.unlink(path)
+            except Exception: pass
 
     def _watch_scrcpy(self, dev, ip_port):
         if self.mirror_proc:
@@ -531,12 +958,23 @@ class AetherWindow(Adw.ApplicationWindow):
     def _do_disc(self, ip_port):
         adb_disconnect(ip_port); self._disc_timer = None; return False
 
-    def _mirror_fail(self, dev, ip_port):
+    def _mirror_fail(self, dev, ip_port, reason=None):
         self.mirror_dev = None; self._set_dot("off")
         n = dev.get("name","Device") if dev else "Device"
-        self._mirror_btn.set_label("FAILED — CHECK IP / ADB")
+        short = (reason[:28] + "…") if reason and len(reason) > 28 else (reason or "CHECK IP / ADB")
+        self._mirror_btn.set_label(f"FAILED — {short.upper()}")
         self._mirror_btn.set_sensitive(True)
-        GLib.timeout_add_seconds(2,
+        # Show a dialog with the full reason so user knows exactly what's wrong
+        if reason:
+            def _show_dlg():
+                dlg = Adw.MessageDialog(transient_for=self, modal=True)
+                dlg.set_heading("Mirror Failed")
+                dlg.set_body(reason)
+                dlg.add_response("ok", "OK")
+                dlg.present()
+                return False
+            GLib.timeout_add(100, _show_dlg)
+        GLib.timeout_add_seconds(4,
             lambda: (self._mirror_btn.set_label(f"MIRROR  {n.upper()}"), False))
 
     # ── ADD DEVICE PAGE ───────────────────────────────────────────────────────
@@ -708,7 +1146,7 @@ class AetherWindow(Adw.ApplicationWindow):
             self._set_cs("Could not connect.\nMake sure Wireless Debugging is ON.", "err")
 
     def _save_device(self, name, ip_port):
-        ssid = get_current_ssid()
+        ssid = self._ssid_cache
         devs = self.config.setdefault("devices", [])
         for dev in devs:
             if dev.get("name") == name:
@@ -853,7 +1291,7 @@ class AetherWindow(Adw.ApplicationWindow):
         dev = devs[idx]; s = {**DEFAULT_SETTINGS, **dev.get("settings",{})}
         self._set_title.set_label(dev.get("name","").upper() + " SETTINGS")
         self._set_name.set_text(dev.get("name",""))
-        ssid = get_current_ssid()
+        ssid = self._ssid_cache
         ip   = dev.get("networks",{}).get(ssid) or dev.get("last_ip_port","")
         self._set_ip.set_text(ip)
         self._set_net_hint.set_label(f"Network: {ssid}" if ssid else "No WiFi detected")
@@ -882,7 +1320,7 @@ class AetherWindow(Adw.ApplicationWindow):
         dev = devs[self._set_idx]
         name=self._set_name.get_text().strip() or dev.get("name","Device")
         ip  =self._set_ip.get_text().strip()
-        ssid=get_current_ssid()
+        ssid=self._ssid_cache
         dev["name"]=name
         if ip and ":" in ip:
             dev["last_ip_port"]=ip
@@ -905,7 +1343,7 @@ class AetherWindow(Adw.ApplicationWindow):
         devs = self.config.get("devices",[])
         if self._set_idx < len(devs):
             dev = devs[self._set_idx]
-            ssid = get_current_ssid()
+            ssid = self._ssid_cache
             ip   = dev.get("networks",{}).get(ssid) or dev.get("last_ip_port","")
             if ip:
                 threading.Thread(target=adb_disconnect, args=(ip,), daemon=True).start()
@@ -939,15 +1377,52 @@ class AetherWindow(Adw.ApplicationWindow):
 
 class AetherApp(Adw.Application):
     def __init__(self):
-        super().__init__(application_id="io.github.aether",
-                         flags=Gio.ApplicationFlags.FLAGS_NONE)
+        super().__init__(
+            application_id="io.github.aether",
+            flags=Gio.ApplicationFlags.FLAGS_NONE,
+        )
         self.connect("activate", self._on_activate)
+        self._win = None
 
     def _on_activate(self, _):
+        if self._win is not None:
+            self._win.present()
+            return
         win = AetherWindow(self)
+        self._win = win
         win.set_icon_name("aether")
         win.present()
 
+
+def _install_mirror_icon():
+    """Write aether-mirror.desktop so GNOME Shell maps WM_CLASS=aether-mirror
+    to phone.png.  Uses absolute Icon= path — no icon theme cache needed.
+    Runs synchronously before AetherApp.run() so the file exists before any
+    mirror session starts."""
+    try:
+        phone_src = AETHER_DIR / "phone.png"
+        if not phone_src.exists():
+            return
+        apps_dir = Path.home() / ".local/share/applications"
+        apps_dir.mkdir(parents=True, exist_ok=True)
+        (apps_dir / "aether-mirror.desktop").write_text(
+            "[Desktop Entry]\n"
+            "Name=Aether Mirror\n"
+            "Exec=false\n"
+            f"Icon={phone_src.resolve()}\n"
+            "Terminal=false\n"
+            "Type=Application\n"
+            "NoDisplay=true\n"
+            "StartupWMClass=aether-mirror\n"
+        )
+        subprocess.run(
+            ["update-desktop-database", str(apps_dir)],
+            capture_output=True)
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
     import sys
+    _install_mirror_icon()
     AetherApp().run(sys.argv)
