@@ -13,21 +13,13 @@ from pathlib import Path
 
 CONFIG_DIR  = Path.home() / ".config" / "aether"
 CONFIG_FILE = CONFIG_DIR / "devices.json"
-_SCRIPT_DIR = Path(__file__).resolve().parent   # may be ~/.local/bin when installed
+_SCRIPT_DIR = Path(__file__).resolve().parent
 
 def _find_aether_dir():
-    """Return the AETHER project folder containing ae.png / phone.png.
-    When the script is run from ~/.local/bin the script dir won't have the
-    assets, so we also check ~/AETHER and the directory of the real file."""
-    candidates = [
-        _SCRIPT_DIR,
-        Path.home() / "AETHER",
-        Path.home() / ".local" / "share" / "aether",
-    ]
-    for p in candidates:
+    for p in [_SCRIPT_DIR, Path.home() / "AETHER", Path.home() / ".local/share/aether"]:
         if (p / "phone.png").exists():
             return p
-    return _SCRIPT_DIR   # fallback (assets may simply be missing)
+    return _SCRIPT_DIR
 
 AETHER_DIR = _find_aether_dir()
 
@@ -505,6 +497,9 @@ class AetherWindow(Adw.ApplicationWindow):
         GLib.idle_add(self._start_mirror, dev, serial, ip_port)
 
     def _start_mirror(self, dev, serial, ip_port):
+        if self._disc_timer:
+            GLib.source_remove(self._disc_timer)
+            self._disc_timer = None
         self.mirror_dev = dev
         self._mirror_ip = ip_port
         args = build_scrcpy_args(dev.get("settings", {}))
@@ -515,7 +510,15 @@ class AetherWindow(Adw.ApplicationWindow):
         try:
             import os as _os
             scrcpy_env = _os.environ.copy()
-            scrcpy_env["SDL_VIDEO_X11_WMCLASS"] = "aether-mirror"
+            # Force native Wayland backend — faster than XWayland.
+            scrcpy_env["SDL_VIDEODRIVER"] = "wayland"
+            # Set the Wayland app_id so GNOME Shell matches this window to
+            # aether-mirror.desktop and shows phone.png as the icon.
+            # SDL_VIDEO_WAYLAND_WMCLASS is the Wayland equivalent of
+            # SDL_VIDEO_X11_WMCLASS — it sets xdg_toplevel app_id without
+            # affecting which backend SDL uses.
+            scrcpy_env["SDL_VIDEO_WAYLAND_WMCLASS"] = "aether-mirror"
+            scrcpy_env.pop("SDL_VIDEO_X11_WMCLASS", None)
             self.mirror_proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -569,10 +572,9 @@ class AetherWindow(Adw.ApplicationWindow):
                         break
             except Exception:
                 pass
+            _proc = self.mirror_proc
             threading.Thread(
-                target=lambda: self.mirror_proc and
-                               self.mirror_proc.stdout and
-                               self.mirror_proc.stdout.read(),
+                target=lambda p=_proc: p.stdout and p.stdout.read(),
                 daemon=True).start()
 
         # ── Step 2: find the window (retry up to 5 s) ────────────────────────
@@ -638,7 +640,7 @@ class AetherWindow(Adw.ApplicationWindow):
             time.sleep(1.0)
             _apply_aspect(tex_w, tex_h)
 
-        # ── Step 4: icon set via SDL_VIDEO_X11_WMCLASS + aether-mirror.desktop ─
+        # ── Step 4: icon set via SDL_VIDEO_WAYLAND_WMCLASS + aether-mirror.desktop
 
         # ── Step 5: hide from taskbar and pager ──────────────────────────────
         run("xprop", "-id", wid,
@@ -1395,10 +1397,10 @@ class AetherApp(Adw.Application):
 
 
 def _install_mirror_icon():
-    """Write aether-mirror.desktop so GNOME Shell maps WM_CLASS=aether-mirror
-    to phone.png.  Uses absolute Icon= path — no icon theme cache needed.
-    Runs synchronously before AetherApp.run() so the file exists before any
-    mirror session starts."""
+    """Write aether-mirror.desktop so GNOME Shell shows phone.png for the
+    mirror window. scrcpy is launched with SDL_VIDEO_WAYLAND_WMCLASS=
+    aether-mirror which sets the Wayland xdg_toplevel app_id. GNOME Shell
+    matches that app_id to this .desktop file and uses its Icon=."""
     try:
         phone_src = AETHER_DIR / "phone.png"
         if not phone_src.exists():
@@ -1415,9 +1417,7 @@ def _install_mirror_icon():
             "NoDisplay=true\n"
             "StartupWMClass=aether-mirror\n"
         )
-        subprocess.run(
-            ["update-desktop-database", str(apps_dir)],
-            capture_output=True)
+        subprocess.run(["update-desktop-database", str(apps_dir)], capture_output=True)
     except Exception:
         pass
 
