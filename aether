@@ -8,7 +8,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 
 from gi.repository import Gtk, Adw, GLib, Gio, Gdk, GdkPixbuf
-import json, subprocess, threading, re
+import json, subprocess, threading, re, socket, random, string, io
 from pathlib import Path
 
 CONFIG_DIR  = Path.home() / ".config" / "aether"
@@ -1007,48 +1007,293 @@ app.run([sys.argv[0], WID])
     def _build_pair_sub(self):
         p = vbox(spacing=0); p.set_vexpand(True)
 
-        p.append(lbl("On your phone:", "page-sub"))
-        p.append(lbl("Settings → Developer options\n→ Wireless debugging\n→ Pair device with pairing code",
-                     "page-sub", wrap=True))
-        sep = Gtk.Separator(); sep.set_margin_top(10); sep.set_margin_bottom(10)
-        p.append(sep)
+        # Scrollable container so QR + fields fit on small windows
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_vexpand(True)
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        inner = vbox(spacing=0)
+        scroll.set_child(inner)
 
-        p.append(lbl("DEVICE NAME", "field-lbl"))
+        inner.append(lbl("DEVICE NAME", "field-lbl"))
         self._pair_name = Gtk.Entry()
         self._pair_name.set_placeholder_text("e.g. Pixel 9")
-        self._pair_name.set_margin_bottom(8)
-        p.append(self._pair_name)
+        self._pair_name.set_margin_bottom(12)
+        inner.append(self._pair_name)
 
-        p.append(lbl("PAIRING IP:PORT", "field-lbl"))
-        p.append(lbl("Shown in 'Pair with code' screen", "page-sub"))
+        # ── QR code section ───────────────────────────────────────────────────
+        inner.append(lbl("SCAN QR CODE", "field-lbl"))
+        inner.append(lbl("Settings → Developer options → Wireless debugging\n→ Pair device with QR code",
+                         "page-sub", wrap=True))
+
+        # Placeholder picture widget — filled by _refresh_qr()
+        self._qr_picture = Gtk.Picture()
+        self._qr_picture.set_halign(Gtk.Align.CENTER)
+        self._qr_picture.set_size_request(170, 170)
+        self._qr_picture.set_margin_top(10)
+        self._qr_picture.set_margin_bottom(2)
+        inner.append(self._qr_picture)
+
+        # QR status / spinner row
+        qr_status_row = hbox(spacing=6); qr_status_row.set_halign(Gtk.Align.CENTER)
+        qr_status_row.set_margin_bottom(4)
+        self._qr_spinner = Gtk.Spinner(); self._qr_spinner.set_halign(Gtk.Align.CENTER)
+        qr_status_row.append(self._qr_spinner)
+        self._qr_status = lbl("", "status-lbl"); self._qr_status.set_halign(Gtk.Align.CENTER)
+        qr_status_row.append(self._qr_status)
+        inner.append(qr_status_row)
+
+        # ── Divider ───────────────────────────────────────────────────────────
+        div_row = hbox(spacing=8); div_row.set_halign(Gtk.Align.FILL)
+        div_row.set_margin_top(4); div_row.set_margin_bottom(10)
+        l_sep = Gtk.Separator(); l_sep.set_hexpand(True); l_sep.set_valign(Gtk.Align.CENTER)
+        r_sep = Gtk.Separator(); r_sep.set_hexpand(True); r_sep.set_valign(Gtk.Align.CENTER)
+        div_row.append(l_sep)
+        div_row.append(lbl("or enter manually", "page-sub"))
+        div_row.append(r_sep)
+        inner.append(div_row)
+
+        # ── Manual fields ─────────────────────────────────────────────────────
+        inner.append(lbl("PAIRING IP:PORT", "field-lbl"))
+        inner.append(lbl("Shown in 'Pair with code' screen", "page-sub"))
         self._pair_ip = Gtk.Entry()
         self._pair_ip.set_placeholder_text("192.168.x.x:PAIR_PORT")
         self._pair_ip.set_margin_top(4); self._pair_ip.set_margin_bottom(8)
-        p.append(self._pair_ip)
+        inner.append(self._pair_ip)
 
-        p.append(lbl("6-DIGIT PAIRING CODE", "field-lbl"))
+        inner.append(lbl("6-DIGIT PAIRING CODE", "field-lbl"))
         self._pair_code = Gtk.Entry()
         self._pair_code.set_placeholder_text("123456")
         self._pair_code.set_max_length(6)
         self._pair_code.set_input_purpose(Gtk.InputPurpose.DIGITS)
         self._pair_code.set_margin_bottom(8)
-        p.append(self._pair_code)
+        inner.append(self._pair_code)
 
         self._pair_status = lbl("", "status-lbl", wrap=True)
-        p.append(self._pair_status)
+        inner.append(self._pair_status)
         self._pair_spinner = Gtk.Spinner()
         self._pair_spinner.set_halign(Gtk.Align.START)
-        p.append(self._pair_spinner)
+        inner.append(self._pair_spinner)
 
-        spacer = Gtk.Box(); spacer.set_vexpand(True)
-        p.append(spacer)
+        p.append(scroll)
 
         self._pair_btn = Gtk.Button(label="Pair Now")
         self._pair_btn.add_css_class("btn-go")
+        self._pair_btn.set_margin_top(8)
         self._pair_btn.connect("clicked", self._do_pair)
         p.append(self._pair_btn)
 
+        # State for QR pairing
+        self._qr_pair_proc  = None   # running `adb pair <port>` process
+        self._qr_pair_port  = None
+        self._qr_pair_pw    = None
+
         self._add_sub.add_named(p, "pair")
+
+    # ── QR pairing helpers ────────────────────────────────────────────────────
+
+    def _start_qr_pair(self):
+        """Generate credentials, render QR, start background adb pair listener."""
+        # Cancel any previous QR pairing session
+        if self._qr_pair_proc:
+            try: self._qr_pair_proc.kill()
+            except Exception: pass
+            self._qr_pair_proc = None
+
+        # Pick a free port and a random password
+        port = self._free_port()
+        pw   = ''.join(random.choices(string.ascii_letters + string.digits, k=12))
+        svc  = "AetherPair_" + ''.join(random.choices(string.ascii_lowercase, k=6))
+
+        self._qr_pair_port = port
+        self._qr_pair_pw   = pw
+
+        # ADB QR pairing string — Android scans this format
+        qr_data = f"WIFI:T:ADB;S:{svc};P:{pw};;"
+
+        # Render the QR image and update the picture widget
+        pixbuf = self._make_qr_pixbuf(qr_data, size=160)
+        if pixbuf:
+            texture = Gdk.Texture.new_for_pixbuf(pixbuf)
+            self._qr_picture.set_paintable(texture)
+            self._qr_status.set_label("")
+        else:
+            self._qr_status.set_label("Install 'qrcode' to show QR")
+
+        # Start adb pair listener in the background
+        self._qr_cancelled = False
+        self._qr_spinner.start()
+        self._qr_status.set_label("Waiting for phone to scan…")
+        threading.Thread(target=self._qr_pair_worker,
+                         args=(svc, pw, port), daemon=True).start()
+
+    def _free_port(self):
+        """Return a random free TCP port."""
+        with socket.socket() as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+
+    def _make_qr_pixbuf(self, data, size=160):
+        """Return a GdkPixbuf with an orange-on-transparent QR code."""
+        try:
+            import qrcode
+            from PIL import Image
+        except ImportError:
+            return None
+
+        qr = qrcode.QRCode(
+            error_correction=qrcode.constants.ERROR_CORRECT_M,
+            box_size=10,
+            border=2,
+        )
+        qr.add_data(data)
+        qr.make(fit=True)
+
+        # Generate black-on-white reliably (fill_color/back_color ignored on some versions)
+        img = qr.make_image(fill_color="black", back_color="white")
+        pil = img.get_image() if hasattr(img, "get_image") else img._img
+        pil = pil.convert("RGBA")
+
+        # Remap: dark pixels -> orange, light pixels -> transparent
+        white  = (255, 255, 255, 255)
+        transp = (0, 0, 0, 0)
+        data_px = pil.load()
+        for y in range(pil.height):
+            for x in range(pil.width):
+                r, g, b, a = data_px[x, y]
+                # dark module = QR data dot -> white; light = background -> transparent
+                if r < 128:
+                    data_px[x, y] = white
+                else:
+                    data_px[x, y] = transp
+
+        pil = pil.resize((size, size), Image.NEAREST)
+
+        # Convert PIL → GdkPixbuf via raw bytes
+        raw = pil.tobytes()
+        pb = GdkPixbuf.Pixbuf.new_from_data(
+            raw,
+            GdkPixbuf.Colorspace.RGB,
+            True,   # has_alpha
+            8,
+            pil.width, pil.height,
+            pil.width * 4,
+        )
+        return pb
+
+    def _qr_pair_worker(self, svc, pw, port):
+        """
+        Correct QR pairing flow:
+          1. QR encodes  WIFI:T:ADB;S:<svc>;P:<pw>;;
+          2. Phone scans QR, then advertises _adb-tls-pairing._tcp
+             with instance name = <svc> over mDNS.
+          3. We watch avahi-browse for that exact instance name.
+          4. Once found, grab the resolved IPv4 address + port.
+          5. Run  adb pair <ip:port>  and send <pw> as the pairing code.
+        """
+        import time
+
+        host_ip = self._get_local_ip()
+        GLib.idle_add(self._set_qr_status, "Scan QR with phone → Wireless debugging → Pair with QR code")
+
+        # Launch avahi-browse in streaming mode (-p = parseable, -r = resolve, no -t so it keeps running)
+        try:
+            browse_proc = subprocess.Popen(
+                ["avahi-browse", "_adb-tls-pairing._tcp", "--resolve", "-p"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            self._qr_pair_proc = browse_proc
+        except FileNotFoundError:
+            GLib.idle_add(self._qr_pair_done, False, host_ip, None,
+                          "avahi-browse not found — install avahi-tools")
+            return
+
+        # Read lines from avahi-browse until we find our service resolved with IPv4
+        # Parseable format lines look like:
+        #   =;wlp0s20f3;IPv4;AetherPair_xxx;_adb-tls-pairing._tcp;local;Android.local;10.0.0.x;PORT;txt
+        found_ip_port = None
+        deadline = time.time() + 90
+        while time.time() < deadline:
+            if getattr(self, "_qr_cancelled", False):
+                break
+            try:
+                browse_proc.stdout.fileno()  # check still open
+                line = browse_proc.stdout.readline()
+            except Exception:
+                break
+            if not line:
+                if browse_proc.poll() is not None:
+                    break
+                time.sleep(0.1)
+                continue
+
+            # Only care about fully-resolved (=) IPv4 lines for our service
+            parts = line.strip().split(";")
+            if len(parts) < 9:
+                continue
+            resolved, iface, proto, name, stype, domain, hostname, addr, p = parts[:9]
+            if resolved != "=" or proto != "IPv4":
+                continue
+            if stype != "_adb-tls-pairing._tcp":
+                continue
+            if name != svc:
+                continue
+            # Validate it looks like an IP
+            if not addr or addr.startswith("fe80") or ":" in addr:
+                continue
+            found_ip_port = f"{addr}:{p}"
+            break
+
+        try: browse_proc.terminate()
+        except Exception: pass
+
+        if not found_ip_port:
+            if not getattr(self, "_qr_cancelled", False):
+                GLib.idle_add(self._qr_pair_done, False, host_ip, None,
+                              "Phone not found.\nMake sure both devices are on the same Wi-Fi\nand Wireless debugging is on.")
+            return
+
+        GLib.idle_add(self._set_qr_status, f"Phone found at {found_ip_port} — pairing…")
+        ok = adb_pair(found_ip_port, pw, timeout=30)
+        GLib.idle_add(self._qr_pair_done, ok, host_ip, found_ip_port, None)
+
+    def _set_qr_status(self, msg):
+        """Main-thread helper to update the QR status label."""
+        self._qr_status.set_label(msg)
+        return False
+
+    def _get_local_ip(self):
+        """Best-guess local LAN IP."""
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect(("8.8.8.8", 80))
+                return s.getsockname()[0]
+        except Exception:
+            return "127.0.0.1"
+
+    def _qr_pair_done(self, ok, host_ip, port, errmsg=None):
+        self._qr_spinner.stop()
+        if ok:
+            self._qr_status.set_label("✓  Paired via QR!")
+            self._qr_status.remove_css_class("status-lbl")
+            self._qr_status.add_css_class("status-ok")
+            # Pre-fill connect IP using the phone's IP from found_ip_port (e.g. "10.0.0.112:38327")
+            # The connect port is different from the pairing port, so we just pre-fill the IP + ":"
+            if port and ":" in port:
+                ip = port.rsplit(":", 1)[0]
+            else:
+                ip = host_ip or self._get_local_ip()
+            self._conn_ip.set_text(ip + ":")
+            name = self._pair_name.get_text().strip()
+            if name:
+                self._pending_name = name
+            GLib.timeout_add(800, self._go_connect)
+        else:
+            msg = errmsg if errmsg else "QR session ended — open Add Device again"
+            self._qr_status.set_label(msg)
+            self._qr_status.remove_css_class("status-ok")
+            self._qr_status.add_css_class("status-lbl")
 
     def _build_connect_sub(self):
         p = vbox(spacing=0); p.set_vexpand(True)
@@ -1095,6 +1340,16 @@ app.run([sys.argv[0], WID])
         self._add_title.set_label("PAIR DEVICE")
         self._add_sub.set_visible_child_name("pair")
         self.stack.set_visible_child_name(PAGE_ADD)
+        # Auto-generate a fresh QR when opening the page
+        self._start_qr_pair()
+
+    def _cancel_qr_session(self):
+        """Signal the QR worker thread to stop polling."""
+        self._qr_cancelled = True
+        if getattr(self, "_qr_pair_proc", None):
+            try: self._qr_pair_proc.kill()
+            except Exception: pass
+            self._qr_pair_proc = None
 
     def _do_pair(self, _):
         name = self._pair_name.get_text().strip()
@@ -1366,6 +1621,7 @@ app.run([sys.argv[0], WID])
     # ── Nav ───────────────────────────────────────────────────────────────────
 
     def _to_home(self):
+        self._cancel_qr_session()
         self._refresh_home()
         self.stack.set_visible_child_name(PAGE_HOME)
         if self.mirror_dev is None:
